@@ -1,11 +1,74 @@
 import base64
 import datetime as dt
+import os
 import pathlib as pl
+import re
 from typing import Any
 from fastmcp import FastMCP
 from . import graph, auth
 
 mcp = FastMCP("microsoft-mcp")
+
+# SECURITY (C2): confine attachment file reads to an allow-listed directory so a caller
+# cannot exfiltrate arbitrary host files (the OAuth token cache, other services' .env
+# files, /etc/shadow) by passing them as an email attachment path. Defaults to the
+# service's private /tmp (PrivateTmp=true isolates it); override with
+# MICROSOFT_MCP_ATTACHMENT_DIRS (colon-separated).
+_ALLOWED_ATTACHMENT_DIRS = [
+    pl.Path(p).expanduser().resolve()
+    for p in os.environ.get("MICROSOFT_MCP_ATTACHMENT_DIRS", "/tmp").split(":")
+    if p
+]
+
+
+def _safe_attachment_path(file_path: str) -> pl.Path:
+    path = pl.Path(file_path).expanduser().resolve()
+    for base in _ALLOWED_ATTACHMENT_DIRS:
+        try:
+            path.relative_to(base)
+            return path
+        except ValueError:
+            continue
+    raise ValueError(
+        f"Attachment path {path} is outside the allowed attachment directories "
+        f"({', '.join(str(b) for b in _ALLOWED_ATTACHMENT_DIRS)}). Set "
+        "MICROSOFT_MCP_ATTACHMENT_DIRS to permit additional directories."
+    )
+
+
+# Matches an opening/closing/self-closing/declaration HTML tag, e.g. <p>, </p>,
+# <br/>, <div class="x">, <!DOCTYPE html>. Used to auto-detect HTML email bodies so
+# the Graph payload sets contentType correctly (otherwise HTML renders as literal
+# tags in Outlook).
+_HTML_TAG_RE = re.compile(r"<[a-zA-Z!/][^>]*>")
+
+
+def _detect_body_type(body: str) -> str:
+    """Return "HTML" if the body contains an HTML tag, else "Text"."""
+    return "HTML" if _HTML_TAG_RE.search(body or "") else "Text"
+
+
+def _build_body(body: str, body_type: str | None = None) -> dict[str, str]:
+    """Build a Graph message body object, choosing the content type.
+
+    body_type, when provided, overrides auto-detection and must be "HTML" or
+    "Text" (case-insensitive). When omitted, the type is auto-detected: "HTML" if
+    the body contains an HTML tag, otherwise "Text".
+    """
+    if body_type:
+        normalized = body_type.strip().casefold()
+        if normalized == "html":
+            content_type = "HTML"
+        elif normalized == "text":
+            content_type = "Text"
+        else:
+            raise ValueError(
+                f"body_type must be 'HTML' or 'Text', got {body_type!r}"
+            )
+    else:
+        content_type = _detect_body_type(body)
+    return {"contentType": content_type, "content": body}
+
 
 FOLDERS = {
     k.casefold(): v
@@ -57,7 +120,7 @@ def authenticate_account() -> dict[str, str]:
         "step4": "After authenticating, use the 'complete_authentication' tool to finish the process",
         "device_code": flow["user_code"],
         "verification_url": verification_url,
-        "expires_in": flow.get("expires_in", 900),
+        "expires_in": str(flow.get("expires_in", 900)),
         "_flow_cache": str(flow),
     }
 
@@ -217,13 +280,18 @@ def create_email_draft(
     body: str,
     cc: str | list[str] | None = None,
     attachments: str | list[str] | None = None,
+    body_type: str | None = None,
 ) -> dict[str, Any]:
-    """Create an email draft with file path(s) as attachments"""
+    """Create an email draft with file path(s) as attachments
+
+    body_type: optional "HTML" or "Text" to force the body content type. When
+    omitted, the type is auto-detected (HTML if the body contains an HTML tag).
+    """
     to_list = [to] if isinstance(to, str) else to
 
     message = {
         "subject": subject,
-        "body": {"contentType": "Text", "content": body},
+        "body": _build_body(body, body_type),
         "toRecipients": [{"emailAddress": {"address": addr}} for addr in to_list],
     }
 
@@ -242,7 +310,7 @@ def create_email_draft(
             [attachments] if isinstance(attachments, str) else attachments
         )
         for file_path in attachment_paths:
-            path = pl.Path(file_path).expanduser().resolve()
+            path = _safe_attachment_path(file_path)
             content_bytes = path.read_bytes()
             att_size = len(content_bytes)
             att_name = path.name
@@ -293,13 +361,18 @@ def send_email(
     body: str,
     cc: str | list[str] | None = None,
     attachments: str | list[str] | None = None,
+    body_type: str | None = None,
 ) -> dict[str, str]:
-    """Send an email immediately with file path(s) as attachments"""
+    """Send an email immediately with file path(s) as attachments
+
+    body_type: optional "HTML" or "Text" to force the body content type. When
+    omitted, the type is auto-detected (HTML if the body contains an HTML tag).
+    """
     to_list = [to] if isinstance(to, str) else to
 
     message = {
         "subject": subject,
-        "body": {"contentType": "Text", "content": body},
+        "body": _build_body(body, body_type),
         "toRecipients": [{"emailAddress": {"address": addr}} for addr in to_list],
     }
 
@@ -319,7 +392,7 @@ def send_email(
             [attachments] if isinstance(attachments, str) else attachments
         )
         for file_path in attachment_paths:
-            path = pl.Path(file_path).expanduser().resolve()
+            path = _safe_attachment_path(file_path)
             content_bytes = path.read_bytes()
             att_size = len(content_bytes)
             att_name = path.name
@@ -353,7 +426,7 @@ def send_email(
         to_list = [to] if isinstance(to, str) else to
         message = {
             "subject": subject,
-            "body": {"contentType": "Text", "content": body},
+            "body": _build_body(body, body_type),
             "toRecipients": [{"emailAddress": {"address": addr}} for addr in to_list],
         }
         if cc:
@@ -454,19 +527,31 @@ def move_email(
 
 
 @mcp.tool
-def reply_to_email(account_id: str, email_id: str, body: str) -> dict[str, str]:
-    """Reply to an email (sender only)"""
+def reply_to_email(
+    account_id: str, email_id: str, body: str, body_type: str | None = None
+) -> dict[str, str]:
+    """Reply to an email (sender only)
+
+    body_type: optional "HTML" or "Text" to force the body content type. When
+    omitted, the type is auto-detected (HTML if the body contains an HTML tag).
+    """
     endpoint = f"/me/messages/{email_id}/reply"
-    payload = {"message": {"body": {"contentType": "Text", "content": body}}}
+    payload = {"message": {"body": _build_body(body, body_type)}}
     graph.request("POST", endpoint, account_id, json=payload)
     return {"status": "sent"}
 
 
 @mcp.tool
-def reply_all_email(account_id: str, email_id: str, body: str) -> dict[str, str]:
-    """Reply to all recipients of an email"""
+def reply_all_email(
+    account_id: str, email_id: str, body: str, body_type: str | None = None
+) -> dict[str, str]:
+    """Reply to all recipients of an email
+
+    body_type: optional "HTML" or "Text" to force the body content type. When
+    omitted, the type is auto-detected (HTML if the body contains an HTML tag).
+    """
     endpoint = f"/me/messages/{email_id}/replyAll"
-    payload = {"message": {"body": {"contentType": "Text", "content": body}}}
+    payload = {"message": {"body": _build_body(body, body_type)}}
     graph.request("POST", endpoint, account_id, json=payload)
     return {"status": "sent"}
 
