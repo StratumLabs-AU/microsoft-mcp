@@ -1055,3 +1055,251 @@ def unified_search(
             results.setdefault("other", []).append(item)
 
     return {k: v for k, v in results.items() if v}
+
+
+# --- SharePoint sites & lists -------------------------------------------------
+
+_COLUMN_TYPES = (
+    "text",
+    "choice",
+    "number",
+    "currency",
+    "dateTime",
+    "boolean",
+    "personOrGroup",
+    "lookup",
+    "hyperlinkOrPicture",
+    "calculated",
+    "term",
+    "geolocation",
+    "thumbnail",
+)
+
+_SYSTEM_FIELDS = {
+    "ContentType",
+    "Edit",
+    "LinkTitle",
+    "LinkTitleNoMenu",
+    "DocIcon",
+    "ItemChildCount",
+    "FolderChildCount",
+    "AppAuthorLookupId",
+    "AppEditorLookupId",
+    "Attachments",
+}
+
+
+def _encode_share_url(url: str) -> str:
+    encoded = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+    return f"u!{encoded}"
+
+
+def _clean_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    return {
+        k: v
+        for k, v in fields.items()
+        if not k.startswith(("@", "_")) and k not in _SYSTEM_FIELDS
+    }
+
+
+def _format_list(lst: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "site_id": lst.get("parentReference", {}).get("siteId"),
+        "list_id": lst["id"],
+        "name": lst.get("displayName") or lst.get("name"),
+        "description": lst.get("description"),
+        "template": lst.get("list", {}).get("template"),
+        "web_url": lst.get("webUrl"),
+        "modified": lst.get("lastModifiedDateTime"),
+    }
+
+
+def _format_item(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": item["id"],
+        "web_url": item.get("webUrl"),
+        "created": item.get("createdDateTime"),
+        "modified": item.get("lastModifiedDateTime"),
+        "fields": _clean_fields(item.get("fields", {})),
+    }
+
+
+@mcp.tool
+def resolve_sharepoint_url(url: str, account_id: str) -> dict[str, Any]:
+    """Resolve a SharePoint URL to site_id (and list_id when it points at a list).
+
+    Accepts a sharing link (e.g. https://tenant.sharepoint.com/:l:/s/site/...),
+    a site URL (https://tenant.sharepoint.com/sites/site) or a list URL
+    (https://tenant.sharepoint.com/sites/site/Lists/MyList/AllItems.aspx).
+    """
+    parsed = url.split("?")[0]
+    host_and_path = parsed.split("://", 1)[-1]
+    host, _, path = host_and_path.partition("/")
+
+    if re.match(r"^:[a-z]:/", path):
+        lst = graph.request("GET", f"/shares/{_encode_share_url(url)}/list", account_id)
+        if not lst:
+            raise ValueError(f"Sharing link did not resolve to a list: {url}")
+        return _format_list(lst)
+
+    match = re.match(r"^((?:sites|teams)/[^/]+)(?:/Lists/([^/]+))?", path)
+    site_path = f":/{match.group(1)}" if match else ""
+    site = graph.request("GET", f"/sites/{host}{site_path}", account_id)
+    if not site:
+        raise ValueError(f"Could not resolve site: {url}")
+
+    result = {"site_id": site["id"], "site_name": site.get("displayName")}
+    if match and match.group(2):
+        list_name = match.group(2)
+        lists = graph.request_paginated(
+            f"/sites/{site['id']}/lists",
+            account_id,
+            params={"$select": "id,name,displayName,webUrl"},
+        )
+        for lst in lists:
+            if lst.get("webUrl", "").rstrip("/").endswith(f"/Lists/{list_name}"):
+                result.update(list_id=lst["id"], name=lst.get("displayName"))
+                break
+    return result
+
+
+@mcp.tool
+def list_sharepoint_lists(
+    site_id: str, account_id: str, include_hidden: bool = False
+) -> list[dict[str, Any]]:
+    """List the lists (and document libraries) in a SharePoint site"""
+    params = {"$select": "id,name,displayName,description,webUrl,lastModifiedDateTime,list,parentReference"}
+    lists = graph.request_paginated(f"/sites/{site_id}/lists", account_id, params=params)
+    return [
+        _format_list(lst)
+        for lst in lists
+        if include_hidden or not lst.get("list", {}).get("hidden")
+    ]
+
+
+@mcp.tool
+def get_sharepoint_list_columns(
+    site_id: str, list_id: str, account_id: str, include_system: bool = False
+) -> list[dict[str, Any]]:
+    """Get a SharePoint list's columns: internal name (use this in fields/filters),
+    display name, type, and choices for choice columns"""
+    columns = graph.request_paginated(
+        f"/sites/{site_id}/lists/{list_id}/columns", account_id
+    )
+    result = []
+    for col in columns:
+        if not include_system and (
+            col.get("hidden") or (col.get("readOnly") and col["name"] != "Title")
+        ):
+            continue
+        col_type = next((t for t in _COLUMN_TYPES if t in col), "unknown")
+        entry = {
+            "name": col["name"],
+            "display_name": col.get("displayName"),
+            "type": col_type,
+            "required": col.get("required", False),
+            "read_only": col.get("readOnly", False),
+            "description": col.get("description") or None,
+        }
+        if col_type == "choice":
+            entry["choices"] = col["choice"].get("choices", [])
+            entry["multi_select"] = col["choice"].get("displayAs") == "checkBoxes"
+        elif col_type == "lookup":
+            entry["lookup_list_id"] = col["lookup"].get("listId")
+        result.append(entry)
+    return result
+
+
+@mcp.tool
+def list_sharepoint_list_items(
+    site_id: str,
+    list_id: str,
+    account_id: str,
+    filter: str | None = None,
+    fields: list[str] | None = None,
+    order_by: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """List items in a SharePoint list with their field values.
+
+    filter: OData filter on internal column names, e.g. "fields/Status eq 'Active'"
+    fields: internal column names to return (default: all)
+    order_by: e.g. "fields/Title desc"
+    """
+    expand = f"fields($select={','.join(fields)})" if fields else "fields"
+    params: dict[str, Any] = {"$expand": expand, "$top": min(limit, 200)}
+    if filter:
+        params["$filter"] = filter
+    if order_by:
+        params["$orderby"] = order_by
+
+    items = graph.request_paginated(
+        f"/sites/{site_id}/lists/{list_id}/items",
+        account_id,
+        params=params,
+        limit=limit,
+        extra_headers={"Prefer": "HonorNonIndexedQueriesWarningMayFailRandomly"},
+    )
+    return [_format_item(item) for item in items]
+
+
+@mcp.tool
+def get_sharepoint_list_item(
+    site_id: str, list_id: str, item_id: str, account_id: str
+) -> dict[str, Any]:
+    """Get a single SharePoint list item with all field values"""
+    item = graph.request(
+        "GET",
+        f"/sites/{site_id}/lists/{list_id}/items/{item_id}",
+        account_id,
+        params={"$expand": "fields"},
+    )
+    if not item:
+        raise ValueError(f"List item {item_id} not found")
+    return _format_item(item)
+
+
+@mcp.tool
+def create_sharepoint_list_item(
+    site_id: str, list_id: str, fields: dict[str, Any], account_id: str
+) -> dict[str, Any]:
+    """Create a SharePoint list item. fields maps internal column names to values,
+    e.g. {"Title": "Project A", "Status": "Active"}"""
+    item = graph.request(
+        "POST",
+        f"/sites/{site_id}/lists/{list_id}/items",
+        account_id,
+        json={"fields": fields},
+    )
+    if not item:
+        raise ValueError("Failed to create list item")
+    return _format_item(item)
+
+
+@mcp.tool
+def update_sharepoint_list_item(
+    site_id: str,
+    list_id: str,
+    item_id: str,
+    fields: dict[str, Any],
+    account_id: str,
+) -> dict[str, Any]:
+    """Update fields on a SharePoint list item (only the fields given are changed)"""
+    result = graph.request(
+        "PATCH",
+        f"/sites/{site_id}/lists/{list_id}/items/{item_id}/fields",
+        account_id,
+        json=fields,
+    )
+    return {"id": item_id, "fields": _clean_fields(result or {})}
+
+
+@mcp.tool
+def delete_sharepoint_list_item(
+    site_id: str, list_id: str, item_id: str, account_id: str
+) -> dict[str, str]:
+    """Delete a SharePoint list item"""
+    graph.request(
+        "DELETE", f"/sites/{site_id}/lists/{list_id}/items/{item_id}", account_id
+    )
+    return {"status": "deleted"}

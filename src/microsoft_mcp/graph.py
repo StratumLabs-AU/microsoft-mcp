@@ -18,9 +18,11 @@ def request(
     json: dict[str, Any] | None = None,
     data: bytes | None = None,
     max_retries: int = 3,
+    extra_headers: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
     headers = {
         "Authorization": f"Bearer {get_token(account_id)}",
+        **(extra_headers or {}),
     }
 
     if method == "GET":
@@ -88,6 +90,7 @@ def request_paginated(
     account_id: str | None = None,
     params: dict[str, Any] | None = None,
     limit: int | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Make paginated requests following @odata.nextLink"""
     items_returned = 0
@@ -95,9 +98,16 @@ def request_paginated(
 
     while True:
         if next_link:
-            result = request("GET", next_link.replace(BASE_URL, ""), account_id)
+            result = request(
+                "GET",
+                next_link.replace(BASE_URL, ""),
+                account_id,
+                extra_headers=extra_headers,
+            )
         else:
-            result = request("GET", path, account_id, params=params)
+            result = request(
+                "GET", path, account_id, params=params, extra_headers=extra_headers
+            )
 
         if not result:
             break
