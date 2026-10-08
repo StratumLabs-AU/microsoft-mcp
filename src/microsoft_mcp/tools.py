@@ -1189,7 +1189,9 @@ def get_sharepoint_list_columns(
     result = []
     for col in columns:
         if not include_system and (
-            col.get("hidden") or (col.get("readOnly") and col["name"] != "Title")
+            col.get("hidden")
+            or col["name"] in _SYSTEM_FIELDS
+            or (col.get("readOnly") and col["name"] != "Title")
         ):
             continue
         col_type = next((t for t in _COLUMN_TYPES if t in col), "unknown")
