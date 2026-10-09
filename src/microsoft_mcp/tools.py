@@ -1311,7 +1311,7 @@ def delete_sharepoint_list_item(
 
 _COLUMN_KINDS = (
     "text", "multiline", "choice", "number", "currency", "date", "datetime",
-    "boolean", "person", "lookup", "hyperlink",
+    "boolean", "person", "lookup",
 )
 
 
@@ -1337,6 +1337,8 @@ def _column_definition(
     kind = kind.lower()
     if kind in ("image", "thumbnail", "picture"):
         raise ValueError("Image columns can't be created through Graph; add them in the SharePoint UI")
+    if kind in ("hyperlink", "url", "link"):
+        raise ValueError("Hyperlink columns can't be created through Graph; use a multiline text column for links, or add one in the SharePoint UI")
     if kind not in _COLUMN_KINDS:
         raise ValueError(f"type must be one of {', '.join(_COLUMN_KINDS)}")
     col: dict[str, Any] = {
@@ -1375,8 +1377,6 @@ def _column_definition(
         if not lookup_list_id:
             raise ValueError("lookup columns need lookup_list_id")
         col["lookup"] = {"listId": lookup_list_id, "columnName": lookup_column, "allowMultipleValues": multi_select}
-    elif kind == "hyperlink":
-        col["hyperlinkOrPicture"] = {"isPicture": False}
     return col
 
 
@@ -1405,7 +1405,7 @@ def create_sharepoint_list(
               {"name": "Fee", "type": "currency", "required": true},
               {"name": "Person", "type": "lookup", "lookup_list_id": "<list id>"}]
     type: text, multiline, choice, number, currency, date, datetime, boolean,
-    person, lookup, hyperlink. Every list already has a Title column.
+    person, lookup. Every list already has a Title column.
     Returns the new list plus any columns that failed.
     """
     lst = graph.request(
@@ -1471,7 +1471,7 @@ def add_list_column(
     """Add a column to a SharePoint list.
 
     type: text, multiline, choice, number, currency, date, datetime, boolean,
-    person, lookup, hyperlink. Image columns can't be created through Graph.
+    person, lookup. Image and hyperlink columns can't be created through Graph.
     multi_select applies to choice, person and lookup columns.
     """
     body = _column_definition(
