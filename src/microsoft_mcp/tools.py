@@ -1305,3 +1305,226 @@ def delete_sharepoint_list_item(
         "DELETE", f"/sites/{site_id}/lists/{list_id}/items/{item_id}", account_id
     )
     return {"status": "deleted"}
+
+
+# --- SharePoint list schema (needs Sites.Manage.All) ---------------------------
+
+_COLUMN_KINDS = (
+    "text", "multiline", "choice", "number", "currency", "date", "datetime",
+    "boolean", "person", "lookup", "hyperlink",
+)
+
+
+def _internal_name(display_name: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9]", "", display_name)
+    if not name:
+        raise ValueError(f"Column name {display_name!r} needs at least one letter or digit")
+    return name if not name[0].isdigit() else f"C{name}"
+
+
+def _column_definition(
+    display_name: str,
+    kind: str,
+    *,
+    choices: list[str] | None = None,
+    multi_select: bool = False,
+    required: bool = False,
+    description: str | None = None,
+    lookup_list_id: str | None = None,
+    lookup_column: str = "Title",
+    default: str | None = None,
+) -> dict[str, Any]:
+    kind = kind.lower()
+    if kind in ("image", "thumbnail", "picture"):
+        raise ValueError("Image columns can't be created through Graph; add them in the SharePoint UI")
+    if kind not in _COLUMN_KINDS:
+        raise ValueError(f"type must be one of {', '.join(_COLUMN_KINDS)}")
+    col: dict[str, Any] = {
+        "name": _internal_name(display_name),
+        "displayName": display_name,
+        "required": required,
+    }
+    if description:
+        col["description"] = description
+    if default is not None:
+        col["defaultValue"] = {"value": str(default)}
+    if kind == "text":
+        col["text"] = {}
+    elif kind == "multiline":
+        col["text"] = {"allowMultipleLines": True, "linesForEditing": 6}
+    elif kind == "choice":
+        if not choices:
+            raise ValueError("choice columns need a list of choices")
+        col["choice"] = {
+            "choices": list(dict.fromkeys(choices)),
+            "displayAs": "checkBoxes" if multi_select else "dropDownMenu",
+        }
+    elif kind == "number":
+        col["number"] = {}
+    elif kind == "currency":
+        col["currency"] = {"locale": "en-AU"}
+    elif kind == "date":
+        col["dateTime"] = {"format": "dateOnly"}
+    elif kind == "datetime":
+        col["dateTime"] = {"format": "dateTime"}
+    elif kind == "boolean":
+        col["boolean"] = {}
+    elif kind == "person":
+        col["personOrGroup"] = {"allowMultipleSelection": multi_select, "chooseFromType": "peopleOnly"}
+    elif kind == "lookup":
+        if not lookup_list_id:
+            raise ValueError("lookup columns need lookup_list_id")
+        col["lookup"] = {"listId": lookup_list_id, "columnName": lookup_column, "allowMultipleValues": multi_select}
+    elif kind == "hyperlink":
+        col["hyperlinkOrPicture"] = {"isPicture": False}
+    return col
+
+
+def _resolve_column(site_id: str, list_id: str, column: str, account_id: str) -> dict[str, Any]:
+    cols = graph.request("GET", f"/sites/{site_id}/lists/{list_id}/columns", account_id) or {}
+    for c in cols.get("value", []):
+        if column in (c.get("id"), c.get("name"), c.get("displayName")):
+            return c
+    raise ValueError(f"No column {column!r} in list {list_id}")
+
+
+@mcp.tool
+def create_sharepoint_list(
+    site_id: str,
+    display_name: str,
+    account_id: str,
+    description: str | None = None,
+    columns: list[dict[str, Any]] | None = None,
+    document_library: bool = False,
+) -> dict[str, Any]:
+    """Create a SharePoint list (or document library) with optional columns.
+
+    columns: [{"name": "Client", "type": "text"},
+              {"name": "Stage", "type": "choice", "choices": ["Briefing", "Building"]},
+              {"name": "Sectors", "type": "choice", "choices": [...], "multi_select": true},
+              {"name": "Fee", "type": "currency", "required": true},
+              {"name": "Person", "type": "lookup", "lookup_list_id": "<list id>"}]
+    type: text, multiline, choice, number, currency, date, datetime, boolean,
+    person, lookup, hyperlink. Every list already has a Title column.
+    Returns the new list plus any columns that failed.
+    """
+    lst = graph.request(
+        "POST",
+        f"/sites/{site_id}/lists",
+        account_id,
+        json={
+            "displayName": display_name,
+            "description": description or "",
+            "list": {"template": "documentLibrary" if document_library else "genericList"},
+        },
+    )
+    if not lst:
+        raise ValueError("Failed to create list")
+    created, failed = [], []
+    for spec in columns or []:
+        spec = dict(spec)
+        name = spec.pop("name", None) or spec.pop("display_name", None)
+        kind = spec.pop("type", "text")
+        try:
+            body = _column_definition(name, kind, **spec)
+            graph.request("POST", f"/sites/{site_id}/lists/{lst['id']}/columns", account_id, json=body)
+            created.append(name)
+        except Exception as e:  # keep going; report per-column failures
+            failed.append({"column": name, "error": str(e)[:200]})
+    out = _format_list(lst)
+    out["site_id"] = out.get("site_id") or site_id
+    out.update(columns_created=created, columns_failed=failed)
+    return out
+
+
+@mcp.tool
+def update_sharepoint_list(
+    site_id: str,
+    list_id: str,
+    account_id: str,
+    display_name: str | None = None,
+    description: str | None = None,
+) -> dict[str, Any]:
+    """Rename a SharePoint list or change its description"""
+    body = {k: v for k, v in (("displayName", display_name), ("description", description)) if v is not None}
+    if not body:
+        raise ValueError("Nothing to update")
+    lst = graph.request("PATCH", f"/sites/{site_id}/lists/{list_id}", account_id, json=body)
+    return _format_list(lst or {"id": list_id})
+
+
+@mcp.tool
+def add_list_column(
+    site_id: str,
+    list_id: str,
+    name: str,
+    account_id: str,
+    type: str = "text",
+    choices: list[str] | None = None,
+    multi_select: bool = False,
+    required: bool = False,
+    description: str | None = None,
+    lookup_list_id: str | None = None,
+    lookup_column: str = "Title",
+    default: str | None = None,
+) -> dict[str, Any]:
+    """Add a column to a SharePoint list.
+
+    type: text, multiline, choice, number, currency, date, datetime, boolean,
+    person, lookup, hyperlink. Image columns can't be created through Graph.
+    multi_select applies to choice, person and lookup columns.
+    """
+    body = _column_definition(
+        name, type, choices=choices, multi_select=multi_select, required=required,
+        description=description, lookup_list_id=lookup_list_id, lookup_column=lookup_column, default=default,
+    )
+    col = graph.request("POST", f"/sites/{site_id}/lists/{list_id}/columns", account_id, json=body)
+    return {"id": (col or {}).get("id"), "name": body["name"], "display_name": name, "type": type}
+
+
+@mcp.tool
+def update_list_column(
+    site_id: str,
+    list_id: str,
+    column: str,
+    account_id: str,
+    display_name: str | None = None,
+    description: str | None = None,
+    required: bool | None = None,
+    choices: list[str] | None = None,
+    hidden: bool | None = None,
+) -> dict[str, Any]:
+    """Change a column: rename it, change its description or required flag,
+    replace its choices (choice columns), or hide it. column: id, internal name
+    or display name. A column's type can't be changed; add a new column instead."""
+    col = _resolve_column(site_id, list_id, column, account_id)
+    body: dict[str, Any] = {}
+    if display_name is not None:
+        body["displayName"] = display_name
+    if description is not None:
+        body["description"] = description
+    if required is not None:
+        body["required"] = required
+    if hidden is not None:
+        body["hidden"] = hidden
+    if choices is not None:
+        if "choice" not in col:
+            raise ValueError(f"{col.get('displayName')} is not a choice column")
+        body["choice"] = {**col["choice"], "choices": list(dict.fromkeys(choices))}
+    if not body:
+        raise ValueError("Nothing to update")
+    graph.request("PATCH", f"/sites/{site_id}/lists/{list_id}/columns/{col['id']}", account_id, json=body)
+    return {"id": col["id"], "name": col.get("name"), "updated": sorted(body)}
+
+
+@mcp.tool
+def delete_list_column(
+    site_id: str, list_id: str, column: str, account_id: str
+) -> dict[str, str]:
+    """Delete a column and all its data from a SharePoint list. Confirm with the
+    user first. column: id, internal name or display name."""
+    col = _resolve_column(site_id, list_id, column, account_id)
+    if col.get("readOnly") or col.get("name") == "Title":
+        raise ValueError(f"{col.get('displayName')} is a built-in column and can't be deleted")
+    graph.request("DELETE", f"/sites/{site_id}/lists/{list_id}/columns/{col['id']}", account_id)
+    return {"status": "deleted", "column": col.get("displayName") or col.get("name")}
